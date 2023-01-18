@@ -100,7 +100,7 @@ func NewSelfSignedCACert(cfg Config, key crypto.Signer) (*x509.Certificate, erro
 			Organization: cfg.Organization,
 		},
 		NotBefore:             now.UTC(),
-		NotAfter:              now.Add(duration365d * 10).UTC(),
+		NotAfter:              now.Add(duration365d * 25).UTC(),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -138,8 +138,37 @@ func MarshalPrivateKeyToPEM(privateKey crypto.PrivateKey) ([]byte, error) {
 	}
 }
 
+func x509Cert(certData []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(certData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: " + err.Error())
+	}
+	return cert, nil
+}
+
+func rsaPrivateKey(keyData []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(keyData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse key PEM")
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse key: " + err.Error())
+	}
+	return key, nil
+}
+
+type Signer struct {
+	CAKey  []byte
+	CACert []byte
+}
+
 type SelfSignedCert struct {
-	CACert  []byte
+	Signer
 	TLSCert []byte
 	TLSKey  []byte
 }
@@ -159,6 +188,10 @@ func NewSelfSignedCertOrDie(names []string) *SelfSignedCert {
 	}
 
 	caCert := EncodeCertPEM(signingCert)
+	caKey, err := MarshalPrivateKeyToPEM(signingKey)
+	if err != nil {
+		log.Fatalf("Failed to marshal key %v", err)
+	}
 
 	key, err := NewPrivateKey()
 	if err != nil {
@@ -181,16 +214,69 @@ func NewSelfSignedCertOrDie(names []string) *SelfSignedCert {
 	}
 
 	tlsCert := EncodeCertPEM(signedCert)
-
 	tlsKey, err := MarshalPrivateKeyToPEM(key)
 	if err != nil {
 		log.Fatalf("Failed to marshal key %v", err)
 	}
 
 	return &SelfSignedCert{
-		CACert:  caCert,
+		Signer: Signer{
+			CAKey:  caKey,
+			CACert: caCert,
+		},
 		TLSCert: tlsCert,
 		TLSKey:  tlsKey,
 	}
+
+}
+
+// UpdateTLS uses the same signing certificate to issue a new tls certificate
+func (s *SelfSignedCert) UpdateTLS() error {
+
+	signingCert, err := x509Cert(s.CACert)
+	if err != nil {
+		return err
+	}
+	signingKey, err := rsaPrivateKey(s.CAKey)
+	if err != nil {
+		return err
+	}
+
+	// Extract the dns names to make this a minimal update
+	oldTLSCert, err := x509Cert(s.TLSCert)
+	if err != nil {
+		return err
+	}
+	names := oldTLSCert.DNSNames
+
+	key, err := NewPrivateKey()
+	if err != nil {
+		return fmt.Errorf("failed to create private key for %v", err)
+	}
+
+	signedCert, err := NewSignedCert(
+		&Config{
+			CommonName: names[0],
+			AltNames: AltNames{
+				DNSNames: names,
+			},
+			Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		},
+		key, signingCert, signingKey,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create cert%v", err)
+	}
+
+	tlsCert := EncodeCertPEM(signedCert)
+	tlsKey, err := MarshalPrivateKeyToPEM(key)
+	if err != nil {
+		return fmt.Errorf("failed to marshal key %v", err)
+	}
+
+	s.TLSCert = tlsCert
+	s.TLSKey = tlsKey
+
+	return nil
 
 }
